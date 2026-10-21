@@ -36,13 +36,13 @@ esphome:
 external_components:
   - source:
       type: git
-      url: https://github.com/svenar-iot/esphome-comfoair
+      url: https://github.com/yannickvr/esphome-comfoair
     components: [comfoair_ca]
   # - source: components
   #   components: [comfoair_ca]
 
 dashboard_import:
-  package_import_url: github://svenar-iot/esphome-comfoair/comfoair_ca.yaml
+  package_import_url: github://yannickvr/esphome-comfoair/comfoair_ca.yaml
   import_full_config: false
 
 wifi:
