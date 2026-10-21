@@ -41,6 +41,12 @@ namespace esphome
         {
           ::esphome::comfoair_ca::logEnable = value;
         }
+
+        // Defensive: if the unit was left in test mode by a previous crash/reset,
+        // bring it back to normal self-regulation on boot.
+        write_command_(CMD_EXIT_TEST_MODE, nullptr, 0);
+        test_mode_active_ = false;
+        test_mode_exit_at_ms_ = 0;
       }
 
       /// Return the traits of this controller.
@@ -189,6 +195,12 @@ namespace esphome
         case 9:
           get_time_delay_();
           break;
+        case 10:
+          get_ewt_postheating_();
+          break;
+        case 11:
+          get_analog_values_();
+          break;
         }
 
         update_counter_++;
@@ -198,6 +210,15 @@ namespace esphome
 
       void loop() override
       {
+        // Test-mode safety watchdog: never leave the unit un-regulated. If a
+        // timed override is active and its deadline has passed, exit test mode.
+        if (test_mode_active_ && test_mode_exit_at_ms_ != 0 &&
+            (int32_t)(millis() - test_mode_exit_at_ms_) >= 0)
+        {
+          LOG_WARN(TAG, "Test-mode override timed out, auto-exiting");
+          exit_test_mode_();
+        }
+
         while (available() != 0)
         {
           read_byte(&data_[data_index_]);
@@ -731,6 +752,18 @@ namespace esphome
         }
         case RES_GET_STATUS:
         {
+          // Cache the config bytes for read-modify-write via CMD_SET_STATUS (0xD7).
+          // The 0xD6 reply layout: [0] preheater present, [1] bypass present,
+          // [2] type, [3] size, [4] options bitmask, ... [9] enthalpy, [10] EWT.
+          status_preheater_present_ = msg[0];
+          status_bypass_present_ = msg[1];
+          status_type_ = msg[2];
+          status_size_ = msg[3];
+          status_options_ = msg[4];
+          status_enthalpy_present_ = msg[9];
+          status_ewt_present_ = msg[10];
+          can_send_status_ = true;
+
           if (preheating_present != nullptr)
           {
             preheating_present->publish_state(msg[0]);
@@ -989,6 +1022,17 @@ namespace esphome
         }
         case RES_GET_TIME_DELAY:
         {
+          // Cache the full 8-byte block so writes can read-modify-write.
+          td_bathroom_on_ = msg[0];
+          td_bathroom_off_ = msg[1];
+          td_l1_off_ = msg[2];
+          td_boost_ = msg[3];
+          td_filter_weeks_ = msg[4];
+          td_rf_short_ = msg[5];
+          td_rf_long_ = msg[6];
+          td_cookerhood_off_ = msg[7];
+          can_send_time_delay_ = true;
+
           if (bathroom_switch_on_delay_minutes != nullptr)
           {
             bathroom_switch_on_delay_minutes->publish_state(msg[0]);
@@ -1029,6 +1073,43 @@ namespace esphome
             extractor_hood_switch_off_delay_minutes->publish_state(msg[7]);
           }
 
+          break;
+        }
+        case RES_EWT_POST_HEATING:
+        {
+          // Byte[0] EWT low (°C), Byte[1] EWT high (°C), Byte[2] EWT speed up (%),
+          // Byte[3] Kitchen hood speed up (%), Byte[4] Post-heating performance,
+          // Byte[5] Post-heating I parameter, Byte[6] Reheating T desired (°C).
+          // Temperatures are encoded (°C + 20) * 2.
+          ewt_low_ = msg[0];
+          ewt_high_ = msg[1];
+          ewt_speed_up_ = msg[2];
+          cookerhood_speed_up_ = msg[3];
+          postheating_performance_ = msg[4];
+          postheating_i_parameter_ = msg[5];
+          reheating_target_ = msg[6];
+          can_send_ewt_postheating_ = true;
+
+          if (ewt_low_temperature != nullptr)
+            ewt_low_temperature->publish_state((float)msg[0] / 2.0f - 20.0f);
+          if (ewt_high_temperature != nullptr)
+            ewt_high_temperature->publish_state((float)msg[1] / 2.0f - 20.0f);
+          if (ewt_speed_up_level != nullptr)
+            ewt_speed_up_level->publish_state(msg[2]);
+          if (cookerhood_speed_up_level != nullptr)
+            cookerhood_speed_up_level->publish_state(msg[3]);
+          if (reheating_target_temperature != nullptr)
+            reheating_target_temperature->publish_state((float)msg[6] / 2.0f - 20.0f);
+          break;
+        }
+        case RES_GET_ANALOG_VALUES:
+        {
+          // Full 19-byte block. Cache so writes can read-modify-write.
+          for (uint8_t i = 0; i < sizeof(analog_values_); i++)
+          {
+            analog_values_[i] = msg[i];
+          }
+          can_send_analog_values_ = true;
           break;
         }
         }
@@ -1129,6 +1210,18 @@ namespace esphome
         write_command_(CMD_GET_TIME_DELAY, nullptr, 0);
       }
 
+      void get_ewt_postheating_()
+      {
+        LOG_DEBUG(TAG, "getting ewt / postheating");
+        write_command_(CMD_EWT_POST_HEATING, nullptr, 0);
+      }
+
+      void get_analog_values_()
+      {
+        LOG_DEBUG(TAG, "getting analog values");
+        write_command_(CMD_GET_ANALOG_VALUES, nullptr, 0);
+      }
+
       uint8_t get_uint8_t_(uint8_t start_index) const
       {
         return data_[COMMAND_LEN_HEAD + start_index];
@@ -1142,7 +1235,7 @@ namespace esphome
       uint8_t data_[30];
       uint8_t data_index_{0};
       int8_t update_counter_{-4};
-      const int8_t num_update_counter_elements_{9};
+      const int8_t num_update_counter_elements_{11};
 
       uint8_t bootloader_version_[13]{0};
       uint8_t firmware_version_[13]{0};
@@ -1159,6 +1252,46 @@ namespace esphome
       uint8_t exhaust_high_{0};
       uint8_t unused_byte_{0};
       bool can_send_ventilation_levels_{false};
+
+      // Cached time-delay block (CMD_SET_TIME_DELAY 0xCB, 8 bytes)
+      uint8_t td_bathroom_on_{0};
+      uint8_t td_bathroom_off_{0};
+      uint8_t td_l1_off_{0};
+      uint8_t td_boost_{0};
+      uint8_t td_filter_weeks_{0};
+      uint8_t td_rf_short_{0};
+      uint8_t td_rf_long_{0};
+      uint8_t td_cookerhood_off_{0};
+      bool can_send_time_delay_{false};
+
+      // Cached EWT / post-heating block (CMD_SET_EWT_POSTHEATING 0xED, 5 bytes written)
+      uint8_t ewt_low_{0};
+      uint8_t ewt_high_{0};
+      uint8_t ewt_speed_up_{0};
+      uint8_t cookerhood_speed_up_{0};
+      uint8_t reheating_target_{0};
+      // Read-only extras from the 0xEC reply (not part of the 5-byte write)
+      uint8_t postheating_performance_{0};
+      uint8_t postheating_i_parameter_{0};
+      bool can_send_ewt_postheating_{false};
+
+      // Cached analog-values block (CMD_SET_ANALOG_VALUES 0x9F, 19 bytes)
+      uint8_t analog_values_[19]{0};
+      bool can_send_analog_values_{false};
+
+      // Cached unit-config block (CMD_SET_STATUS 0xD7, 8 bytes written; read from 0xD6)
+      uint8_t status_preheater_present_{0};
+      uint8_t status_bypass_present_{0};
+      uint8_t status_type_{0};
+      uint8_t status_size_{0};
+      uint8_t status_options_{0};
+      uint8_t status_enthalpy_present_{0};
+      uint8_t status_ewt_present_{0};
+      bool can_send_status_{false};
+
+      // Test-mode state for the preheater override (Tier 3)
+      bool test_mode_active_{false};
+      uint32_t test_mode_exit_at_ms_{0};
 
     public:
       text_sensor::TextSensor *bootloader_info{nullptr};
@@ -1247,6 +1380,12 @@ namespace esphome
       sensor::Sensor *exhaust_medium_level{nullptr};
       sensor::Sensor *supply_high_level{nullptr};
       sensor::Sensor *exhaust_high_level{nullptr};
+      // EWT / post-heating read-back sensors (0xEC)
+      sensor::Sensor *ewt_low_temperature{nullptr};
+      sensor::Sensor *ewt_high_temperature{nullptr};
+      sensor::Sensor *ewt_speed_up_level{nullptr};
+      sensor::Sensor *cookerhood_speed_up_level{nullptr};
+      sensor::Sensor *reheating_target_temperature{nullptr};
 
       void set_bootloader_info(text_sensor::TextSensor *bootloader_info) { this->bootloader_info = bootloader_info; };
       void set_firmware_info(text_sensor::TextSensor *firmware_info) { this->firmware_info = firmware_info; };
@@ -1409,6 +1548,257 @@ namespace esphome
       uint8_t get_exhaust_medium_level() const { return exhaust_medium_; }
       uint8_t get_supply_high_level() const { return supply_high_; }
       uint8_t get_exhaust_high_level() const { return exhaust_high_; }
+
+      // ---- EWT / post-heating read-back sensor setters ----
+      void set_ewt_low_temperature(sensor::Sensor *s) { this->ewt_low_temperature = s; };
+      void set_ewt_high_temperature(sensor::Sensor *s) { this->ewt_high_temperature = s; };
+      void set_ewt_speed_up_level(sensor::Sensor *s) { this->ewt_speed_up_level = s; };
+      void set_cookerhood_speed_up_level(sensor::Sensor *s) { this->cookerhood_speed_up_level = s; };
+      void set_reheating_target_temperature(sensor::Sensor *s) { this->reheating_target_temperature = s; };
+
+      // =====================================================================
+      // ===================== Tier 1: Time delays (0xCB) ====================
+      // =====================================================================
+      // The device accepts the full 8-byte block only; always read-modify-write
+      // from the cached values so unrelated delays are preserved.
+
+      void send_time_delay_()
+      {
+        if (!can_send_time_delay_)
+        {
+          LOG_WARN(TAG, "Can't send time delays yet (block not read)");
+          return;
+        }
+        uint8_t command_data[8] = {
+            td_bathroom_on_,
+            td_bathroom_off_,
+            td_l1_off_,
+            td_boost_,
+            td_filter_weeks_,
+            td_rf_short_,
+            td_rf_long_,
+            td_cookerhood_off_};
+        write_command_(CMD_SET_TIME_DELAY, command_data, sizeof(command_data));
+      }
+
+      void set_bathroom_switch_on_delay(uint8_t value) { td_bathroom_on_ = value; send_time_delay_(); }
+      void set_bathroom_switch_off_delay(uint8_t value) { td_bathroom_off_ = value; send_time_delay_(); }
+      void set_l1_switch_off_delay(uint8_t value) { td_l1_off_ = value; send_time_delay_(); }
+      void set_boost_ventilation_delay(uint8_t value) { td_boost_ = value; send_time_delay_(); }
+      void set_filter_warning_weeks(uint8_t value) { td_filter_weeks_ = value; send_time_delay_(); }
+      void set_rf_high_time_short(uint8_t value) { td_rf_short_ = value; send_time_delay_(); }
+      void set_rf_high_time_long(uint8_t value) { td_rf_long_ = value; send_time_delay_(); }
+      void set_cookerhood_switch_off_delay(uint8_t value) { td_cookerhood_off_ = value; send_time_delay_(); }
+
+      uint8_t get_bathroom_switch_on_delay() const { return td_bathroom_on_; }
+      uint8_t get_bathroom_switch_off_delay() const { return td_bathroom_off_; }
+      uint8_t get_l1_switch_off_delay() const { return td_l1_off_; }
+      uint8_t get_boost_ventilation_delay() const { return td_boost_; }
+      uint8_t get_filter_warning_weeks_value() const { return td_filter_weeks_; }
+      uint8_t get_rf_high_time_short() const { return td_rf_short_; }
+      uint8_t get_rf_high_time_long() const { return td_rf_long_; }
+      uint8_t get_cookerhood_switch_off_delay() const { return td_cookerhood_off_; }
+
+      // =====================================================================
+      // ================ Tier 1: EWT / post-heating (0xED) ==================
+      // =====================================================================
+      // 5-byte write: [EWT low °C][EWT high °C][EWT speed %][cookerhood speed %]
+      //               [reheat target °C]. Temps encoded (°C+20)*2, % is raw.
+
+      void send_ewt_postheating_()
+      {
+        if (!can_send_ewt_postheating_)
+        {
+          LOG_WARN(TAG, "Can't send EWT/postheating yet (block not read)");
+          return;
+        }
+        uint8_t command_data[5] = {
+            ewt_low_,
+            ewt_high_,
+            ewt_speed_up_,
+            cookerhood_speed_up_,
+            reheating_target_};
+        write_command_(CMD_SET_EWT_POSTHEATING, command_data, sizeof(command_data));
+      }
+
+      static uint8_t encode_temperature_(float celsius)
+      {
+        return (uint8_t)((celsius + 20.0f) * 2.0f);
+      }
+
+      void set_ewt_low_temperature_value(float celsius) { ewt_low_ = encode_temperature_(celsius); send_ewt_postheating_(); }
+      void set_ewt_high_temperature_value(float celsius) { ewt_high_ = encode_temperature_(celsius); send_ewt_postheating_(); }
+      void set_ewt_speed_up(uint8_t percent) { ewt_speed_up_ = percent; send_ewt_postheating_(); }
+      void set_cookerhood_speed_up(uint8_t percent) { cookerhood_speed_up_ = percent; send_ewt_postheating_(); }
+      void set_reheating_target_temperature_value(float celsius) { reheating_target_ = encode_temperature_(celsius); send_ewt_postheating_(); }
+
+      float get_ewt_low_temperature_value() const { return (float)ewt_low_ / 2.0f - 20.0f; }
+      float get_ewt_high_temperature_value() const { return (float)ewt_high_ / 2.0f - 20.0f; }
+      uint8_t get_ewt_speed_up() const { return ewt_speed_up_; }
+      uint8_t get_cookerhood_speed_up() const { return cookerhood_speed_up_; }
+      float get_reheating_target_temperature_value() const { return (float)reheating_target_ / 2.0f - 20.0f; }
+
+      // =====================================================================
+      // ================= Tier 1/2: Resets & self-test (0xDB) ===============
+      // =====================================================================
+      // error_reset() and filter_reset() already exist above. Add the rest.
+
+      void settings_reset(void)
+      {
+        uint8_t reset_cmd[4] = {0, 1, 0, 0};
+        write_command_(CMD_RESET_AND_SELF_TEST, reset_cmd, sizeof(reset_cmd));
+      }
+
+      void start_self_test(void)
+      {
+        uint8_t reset_cmd[4] = {0, 0, 1, 0};
+        write_command_(CMD_RESET_AND_SELF_TEST, reset_cmd, sizeof(reset_cmd));
+      }
+
+      // =====================================================================
+      // ================ Tier 2: Unit config / option flags (0xD7) ==========
+      // =====================================================================
+      // 8-byte write. We read-modify-write from the cached 0xD6 reply so that
+      // flags we don't touch are preserved. NOTE: per the protocol investigation,
+      // the "preheater present" position differs between sources (registers.h
+      // byte 0 vs openHAB byte4 bit0x40) and is UNVERIFIED on the WHR 930.
+      // These are installer/config flags — guard behind developer mode.
+
+      void send_status_()
+      {
+        if (!can_send_status_)
+        {
+          LOG_WARN(TAG, "Can't send status/config yet (block not read)");
+          return;
+        }
+        // 0xD6 read reply is 11 bytes; the 0xD7 write block is 8 bytes:
+        // [preheater present][bypass present][type][size][options bitmask]
+        // [reserved=0][enthalpy present][EWT present]
+        uint8_t command_data[8] = {
+            status_preheater_present_,
+            status_bypass_present_,
+            status_type_,
+            status_size_,
+            status_options_,
+            0x00,
+            status_enthalpy_present_,
+            status_ewt_present_};
+        write_command_(CMD_SET_STATUS, command_data, sizeof(command_data));
+      }
+
+      void set_cfg_preheater_present(bool present) { status_preheater_present_ = present ? 1 : 0; send_status_(); }
+      void set_cfg_bypass_present(bool present) { status_bypass_present_ = present ? 1 : 0; send_status_(); }
+      void set_cfg_type(uint8_t value) { status_type_ = value; send_status_(); }
+      void set_cfg_size(uint8_t value) { status_size_ = value; send_status_(); }
+      void set_cfg_enthalpy_present(uint8_t value) { status_enthalpy_present_ = value; send_status_(); }
+      void set_cfg_ewt_present(uint8_t value) { status_ewt_present_ = value; send_status_(); }
+
+      void set_cfg_option_bit_(uint8_t mask, bool enable)
+      {
+        if (enable)
+          status_options_ |= mask;
+        else
+          status_options_ &= ~mask;
+        send_status_();
+      }
+      void set_cfg_fireplace_present(bool v) { set_cfg_option_bit_(0x01, v); }
+      void set_cfg_kitchen_hood_present(bool v) { set_cfg_option_bit_(0x02, v); }
+      void set_cfg_postheating_present(bool v) { set_cfg_option_bit_(0x04, v); }
+      void set_cfg_postheating_pwm_present(bool v) { set_cfg_option_bit_(0x40, v); }
+
+      bool get_cfg_preheater_present() const { return status_preheater_present_ != 0; }
+      bool get_cfg_bypass_present() const { return status_bypass_present_ != 0; }
+      uint8_t get_cfg_type() const { return status_type_; }
+      uint8_t get_cfg_size() const { return status_size_; }
+      uint8_t get_cfg_enthalpy_present() const { return status_enthalpy_present_; }
+      uint8_t get_cfg_ewt_present() const { return status_ewt_present_; }
+      bool get_cfg_fireplace_present() const { return (status_options_ & 0x01) != 0; }
+      bool get_cfg_kitchen_hood_present() const { return (status_options_ & 0x02) != 0; }
+      bool get_cfg_postheating_present() const { return (status_options_ & 0x04) != 0; }
+      bool get_cfg_postheating_pwm_present() const { return (status_options_ & 0x40) != 0; }
+
+      // =====================================================================
+      // ============== Tier 2: Analog input configuration (0x9F) ============
+      // =====================================================================
+      // 19-byte block. Advanced; read-modify-write the cached 0x9E reply.
+
+      void send_analog_values_()
+      {
+        if (!can_send_analog_values_)
+        {
+          LOG_WARN(TAG, "Can't send analog values yet (block not read)");
+          return;
+        }
+        write_command_(CMD_SET_ANALOG_VALUES, analog_values_, sizeof(analog_values_));
+      }
+
+      void set_analog_byte(uint8_t index, uint8_t value)
+      {
+        if (index >= sizeof(analog_values_))
+        {
+          LOG_WARN(TAG, "Analog byte index out of range: %u", index);
+          return;
+        }
+        analog_values_[index] = value;
+        send_analog_values_();
+      }
+      uint8_t get_analog_byte(uint8_t index) const
+      {
+        if (index >= sizeof(analog_values_))
+          return 0;
+        return analog_values_[index];
+      }
+
+      void set_analog_priority(uint8_t value) { set_analog_byte(18, value); }
+      uint8_t get_analog_priority() const { return get_analog_byte(18); }
+
+      // =====================================================================
+      // ============ Tier 3: Test-mode preheater override (0x01/0x05/0x19) ==
+      // =====================================================================
+      // DANGER: entering test mode suspends the unit's OWN regulation (including
+      // automatic frost protection). We drive the preheater relay+triac directly
+      // and auto-exit after a timeout so the unit is never left un-regulated.
+      // Gated behind developer mode by the YAML.
+
+      void enter_test_mode_()
+      {
+        write_command_(CMD_SET_TEST_MODE, nullptr, 0);
+        test_mode_active_ = true;
+        LOG_WARN(TAG, "ENTERED TEST MODE - unit self-regulation is suspended");
+      }
+
+      void exit_test_mode_()
+      {
+        write_command_(CMD_EXIT_TEST_MODE, nullptr, 0);
+        test_mode_active_ = false;
+        test_mode_exit_at_ms_ = 0;
+        LOG_WARN(TAG, "Exited test mode - unit resumes self-regulation");
+      }
+
+      // Force the preheater on for `duration_seconds`, then auto-exit test mode.
+      // relay_mask: 0x01 preheating relay, 0x02 triac preheating (combine as needed).
+      void force_preheater(uint32_t duration_seconds, uint8_t relay_mask = 0x03)
+      {
+        enter_test_mode_();
+        uint8_t outputs[2] = {(uint8_t)(relay_mask & 0x3F), 0x00};
+        write_command_(CMD_SET_OUTPUTS, outputs, sizeof(outputs));
+        test_mode_exit_at_ms_ = millis() + duration_seconds * 1000UL;
+        LOG_WARN(TAG, "Forcing preheater (mask 0x%02X) for %u s", relay_mask, duration_seconds);
+      }
+
+      // Drive the preheating flap directly in test mode (1 open / 0 closed / 3 stop).
+      void force_preheater_flap(uint8_t state, uint32_t duration_seconds)
+      {
+        enter_test_mode_();
+        uint8_t flaps[2] = {0x03 /* bypass = stop (leave) */, state};
+        write_command_(CMD_SET_FLAPS, flaps, sizeof(flaps));
+        test_mode_exit_at_ms_ = millis() + duration_seconds * 1000UL;
+        LOG_WARN(TAG, "Driving preheater flap to %u for %u s", state, duration_seconds);
+      }
+
+      void stop_test_mode_override() { exit_test_mode_(); }
+
+      bool get_test_mode_active() const { return test_mode_active_; }
     };
 
   } // namespace comfoair_ca

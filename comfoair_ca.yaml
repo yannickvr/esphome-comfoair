@@ -2,7 +2,7 @@ substitutions:
   node_name: comfoair
   device_name: ComfoAir
   description: ComfoAir Controller
-  developer: Svenar
+  developer: JEMOER
   entity_prefix: ''
 
 globals:
@@ -293,6 +293,16 @@ comfoair_ca:
     name: "RF high time long minutes"
   extractor_hood_switch_off_delay_minutes:
     name: "Extractor hood switch off delay minutes"
+  ewt_low_temperature:
+    name: "EWT low temperature"
+  ewt_high_temperature:
+    name: "EWT high temperature"
+  ewt_speed_up_level:
+    name: "EWT speed up"
+  cookerhood_speed_up_level:
+    name: "Cookerhood speed up"
+  reheating_target_temperature:
+    name: "Reheating target temperature"
 
 button:
   - platform: template
@@ -319,6 +329,63 @@ button:
           auto call = id(comfoair_climate).make_call();
           call.set_fan_mode(climate::CLIMATE_FAN_HIGH);
           call.perform();
+
+  # ---- Resets (Tier 1: safe) ----
+  - platform: template
+    id: reset_filter
+    name: "Reset Filter Counter"
+    icon: "mdi:air-filter"
+    on_press:
+      - lambda: |-
+          id(comfoair_climate).filter_reset();
+  - platform: template
+    id: reset_errors
+    name: "Reset Errors"
+    icon: "mdi:alert-remove"
+    on_press:
+      - lambda: |-
+          id(comfoair_climate).error_reset();
+
+  # ---- Resets / self-test (Tier 2: advanced, use with care) ----
+  - platform: template
+    id: start_self_test
+    name: "Start Self-Test"
+    icon: "mdi:cog-play"
+    entity_category: diagnostic
+    on_press:
+      - lambda: |-
+          id(comfoair_climate).start_self_test();
+  - platform: template
+    id: reset_to_factory_settings
+    name: "Reset Unit To Factory Settings"
+    icon: "mdi:restore-alert"
+    entity_category: config
+    on_press:
+      - lambda: |-
+          ESP_LOGW("custom", "Resetting ComfoAir unit settings to factory defaults");
+          id(comfoair_climate).settings_reset();
+
+  # ---- Tier 3: Test-mode preheater override (DANGEROUS) ----
+  # Entering test mode suspends the unit's own regulation, including automatic
+  # frost protection. These actions force the preheater on for a fixed time and
+  # then auto-exit test mode. Use only knowingly.
+  - platform: template
+    id: force_preheater_60s
+    name: "Force Preheater (60s, test mode)"
+    icon: "mdi:heating-coil"
+    entity_category: config
+    on_press:
+      - lambda: |-
+          ESP_LOGW("custom", "FORCING preheater via test mode for 60s");
+          id(comfoair_climate).force_preheater(60, 0x03);
+  - platform: template
+    id: force_preheater_stop
+    name: "Stop Preheater Override (exit test mode)"
+    icon: "mdi:heating-coil"
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(comfoair_climate).stop_test_mode_override();
 
 switch:
   - platform: factory_reset
@@ -367,6 +434,106 @@ switch:
           if (id(stored_sup_med) == 0) id(stored_sup_med) = 50;
           if (id(stored_sup_hig) == 0) id(stored_sup_hig) = 70;
           id(comfoair_climate).set_supply_levels(id(stored_sup_abs), id(stored_sup_low), id(stored_sup_med), id(stored_sup_hig));
+
+  # ========================================================================
+  # Tier 2: Unit configuration / option flags - CMD_SET_STATUS (0xD7)
+  # These tell the unit what hardware it has. Writing wrong values can disable
+  # sensors or heating, so each write is gated behind Developer Mode. Values
+  # are read-modify-written so untouched flags are preserved.
+  # NOTE: the "Preheater Present" byte position is UNVERIFIED on the WHR 930
+  # (sources disagree: registers.h byte0 vs openHAB options-bit 0x40). Verify
+  # by round-tripping before relying on it.
+  # ========================================================================
+  - platform: template
+    name: "Config: Preheater Present"
+    id: cfg_preheater_present
+    icon: "mdi:heating-coil"
+    entity_category: config
+    lambda: |-
+      return id(comfoair_climate).get_cfg_preheater_present();
+    turn_on_action:
+      - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to change config flags"); return; }
+          id(comfoair_climate).set_cfg_preheater_present(true);
+    turn_off_action:
+      - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to change config flags"); return; }
+          id(comfoair_climate).set_cfg_preheater_present(false);
+  - platform: template
+    name: "Config: Bypass Present"
+    id: cfg_bypass_present
+    icon: "mdi:valve"
+    entity_category: config
+    lambda: |-
+      return id(comfoair_climate).get_cfg_bypass_present();
+    turn_on_action:
+      - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to change config flags"); return; }
+          id(comfoair_climate).set_cfg_bypass_present(true);
+    turn_off_action:
+      - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to change config flags"); return; }
+          id(comfoair_climate).set_cfg_bypass_present(false);
+  - platform: template
+    name: "Config: Fireplace Present"
+    id: cfg_fireplace_present
+    icon: "mdi:fireplace"
+    entity_category: config
+    lambda: |-
+      return id(comfoair_climate).get_cfg_fireplace_present();
+    turn_on_action:
+      - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to change config flags"); return; }
+          id(comfoair_climate).set_cfg_fireplace_present(true);
+    turn_off_action:
+      - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to change config flags"); return; }
+          id(comfoair_climate).set_cfg_fireplace_present(false);
+  - platform: template
+    name: "Config: Kitchen Hood Present"
+    id: cfg_kitchen_hood_present
+    icon: "mdi:stove"
+    entity_category: config
+    lambda: |-
+      return id(comfoair_climate).get_cfg_kitchen_hood_present();
+    turn_on_action:
+      - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to change config flags"); return; }
+          id(comfoair_climate).set_cfg_kitchen_hood_present(true);
+    turn_off_action:
+      - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to change config flags"); return; }
+          id(comfoair_climate).set_cfg_kitchen_hood_present(false);
+  - platform: template
+    name: "Config: Post-Heating Present"
+    id: cfg_postheating_present
+    icon: "mdi:radiator"
+    entity_category: config
+    lambda: |-
+      return id(comfoair_climate).get_cfg_postheating_present();
+    turn_on_action:
+      - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to change config flags"); return; }
+          id(comfoair_climate).set_cfg_postheating_present(true);
+    turn_off_action:
+      - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to change config flags"); return; }
+          id(comfoair_climate).set_cfg_postheating_present(false);
+  - platform: template
+    name: "Config: Post-Heating PWM Mode"
+    id: cfg_postheating_pwm
+    icon: "mdi:radiator"
+    entity_category: config
+    lambda: |-
+      return id(comfoair_climate).get_cfg_postheating_pwm_present();
+    turn_on_action:
+      - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to change config flags"); return; }
+          id(comfoair_climate).set_cfg_postheating_pwm_present(true);
+    turn_off_action:
+      - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to change config flags"); return; }
+          id(comfoair_climate).set_cfg_postheating_pwm_present(false);
 
 number:
   - platform: template
@@ -476,3 +643,318 @@ number:
     lambda: |-
       return id(comfoair_climate).get_exhaust_high_level();
     update_interval: 5s
+
+  # ========================================================================
+  # Tier 1: Time delays (menu P2) - CMD_SET_TIME_DELAY (0xCB)
+  # ========================================================================
+  - platform: template
+    name: "Bathroom Switch On Delay"
+    id: set_bathroom_on_delay
+    icon: "mdi:timer-cog"
+    entity_category: config
+    min_value: 0
+    max_value: 15
+    step: 1
+    unit_of_measurement: "min"
+    set_action:
+      - lambda: |-
+          id(comfoair_climate).set_bathroom_switch_on_delay(static_cast<uint8_t>(x));
+    lambda: |-
+      return id(comfoair_climate).get_bathroom_switch_on_delay();
+    update_interval: 10s
+  - platform: template
+    name: "Bathroom Switch Off Delay"
+    id: set_bathroom_off_delay
+    icon: "mdi:timer-cog"
+    entity_category: config
+    min_value: 0
+    max_value: 120
+    step: 1
+    unit_of_measurement: "min"
+    set_action:
+      - lambda: |-
+          id(comfoair_climate).set_bathroom_switch_off_delay(static_cast<uint8_t>(x));
+    lambda: |-
+      return id(comfoair_climate).get_bathroom_switch_off_delay();
+    update_interval: 10s
+  - platform: template
+    name: "L1 Switch Off Delay"
+    id: set_l1_off_delay
+    icon: "mdi:timer-cog"
+    entity_category: config
+    min_value: 0
+    max_value: 20
+    step: 1
+    unit_of_measurement: "min"
+    set_action:
+      - lambda: |-
+          id(comfoair_climate).set_l1_switch_off_delay(static_cast<uint8_t>(x));
+    lambda: |-
+      return id(comfoair_climate).get_l1_switch_off_delay();
+    update_interval: 10s
+  - platform: template
+    name: "Boost Ventilation Time"
+    id: set_boost_time
+    icon: "mdi:timer-cog"
+    entity_category: config
+    min_value: 0
+    max_value: 120
+    step: 1
+    unit_of_measurement: "min"
+    set_action:
+      - lambda: |-
+          id(comfoair_climate).set_boost_ventilation_delay(static_cast<uint8_t>(x));
+    lambda: |-
+      return id(comfoair_climate).get_boost_ventilation_delay();
+    update_interval: 10s
+  - platform: template
+    name: "Filter Warning Period"
+    id: set_filter_weeks
+    icon: "mdi:air-filter"
+    entity_category: config
+    min_value: 10
+    max_value: 52
+    step: 1
+    unit_of_measurement: "weeks"
+    set_action:
+      - lambda: |-
+          id(comfoair_climate).set_filter_warning_weeks(static_cast<uint8_t>(x));
+    lambda: |-
+      return id(comfoair_climate).get_filter_warning_weeks_value();
+    update_interval: 10s
+  - platform: template
+    name: "RF High Time Short"
+    id: set_rf_short
+    icon: "mdi:timer-cog"
+    entity_category: config
+    min_value: 0
+    max_value: 20
+    step: 1
+    unit_of_measurement: "min"
+    set_action:
+      - lambda: |-
+          id(comfoair_climate).set_rf_high_time_short(static_cast<uint8_t>(x));
+    lambda: |-
+      return id(comfoair_climate).get_rf_high_time_short();
+    update_interval: 10s
+  - platform: template
+    name: "RF High Time Long"
+    id: set_rf_long
+    icon: "mdi:timer-cog"
+    entity_category: config
+    min_value: 0
+    max_value: 120
+    step: 1
+    unit_of_measurement: "min"
+    set_action:
+      - lambda: |-
+          id(comfoair_climate).set_rf_high_time_long(static_cast<uint8_t>(x));
+    lambda: |-
+      return id(comfoair_climate).get_rf_high_time_long();
+    update_interval: 10s
+  - platform: template
+    name: "Cookerhood Switch Off Delay"
+    id: set_cookerhood_off_delay
+    icon: "mdi:timer-cog"
+    entity_category: config
+    min_value: 0
+    max_value: 120
+    step: 1
+    unit_of_measurement: "min"
+    set_action:
+      - lambda: |-
+          id(comfoair_climate).set_cookerhood_switch_off_delay(static_cast<uint8_t>(x));
+    lambda: |-
+      return id(comfoair_climate).get_cookerhood_switch_off_delay();
+    update_interval: 10s
+
+  # ========================================================================
+  # Tier 1: EWT / post-heating - CMD_SET_EWT_POSTHEATING (0xED)
+  # ========================================================================
+  - platform: template
+    name: "Set EWT Low Temperature"
+    id: set_ewt_low
+    icon: "mdi:thermometer-low"
+    entity_category: config
+    min_value: 0
+    max_value: 15
+    step: 0.5
+    unit_of_measurement: "°C"
+    set_action:
+      - lambda: |-
+          id(comfoair_climate).set_ewt_low_temperature_value(x);
+    lambda: |-
+      return id(comfoair_climate).get_ewt_low_temperature_value();
+    update_interval: 10s
+  - platform: template
+    name: "Set EWT High Temperature"
+    id: set_ewt_high
+    icon: "mdi:thermometer-high"
+    entity_category: config
+    min_value: 10
+    max_value: 30
+    step: 0.5
+    unit_of_measurement: "°C"
+    set_action:
+      - lambda: |-
+          id(comfoair_climate).set_ewt_high_temperature_value(x);
+    lambda: |-
+      return id(comfoair_climate).get_ewt_high_temperature_value();
+    update_interval: 10s
+  - platform: template
+    name: "Set EWT Speed Up"
+    id: set_ewt_speed
+    icon: "mdi:fan-plus"
+    entity_category: config
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    set_action:
+      - lambda: |-
+          id(comfoair_climate).set_ewt_speed_up(static_cast<uint8_t>(x));
+    lambda: |-
+      return id(comfoair_climate).get_ewt_speed_up();
+    update_interval: 10s
+  - platform: template
+    name: "Set Cookerhood Speed Up"
+    id: set_cookerhood_speed
+    icon: "mdi:fan-plus"
+    entity_category: config
+    min_value: 0
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    set_action:
+      - lambda: |-
+          id(comfoair_climate).set_cookerhood_speed_up(static_cast<uint8_t>(x));
+    lambda: |-
+      return id(comfoair_climate).get_cookerhood_speed_up();
+    update_interval: 10s
+  - platform: template
+    name: "Set Reheating Target Temperature"
+    id: set_reheating_target
+    icon: "mdi:heating-coil"
+    entity_category: config
+    min_value: 15
+    max_value: 30
+    step: 0.5
+    unit_of_measurement: "°C"
+    set_action:
+      - lambda: |-
+          id(comfoair_climate).set_reheating_target_temperature_value(x);
+    lambda: |-
+      return id(comfoair_climate).get_reheating_target_temperature_value();
+    update_interval: 10s
+
+select:
+  # ========================================================================
+  # Tier 2: Unit configuration enums - CMD_SET_STATUS (0xD7)
+  # Gated behind Developer Mode; read-modify-written. Advanced / installer.
+  # ========================================================================
+  - platform: template
+    name: "Config: Unit Type"
+    id: cfg_unit_type
+    icon: "mdi:air-conditioner"
+    entity_category: config
+    optimistic: true
+    options:
+      - "Left"
+      - "Right"
+    lambda: |-
+      switch (id(comfoair_climate).get_cfg_type()) {
+        case 1: return std::string("Left");
+        case 2: return std::string("Right");
+        default: return std::string("Left");
+      }
+    set_action:
+      - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to change config flags"); return; }
+          uint8_t v = (x == "Right") ? 2 : 1;
+          id(comfoair_climate).set_cfg_type(v);
+  - platform: template
+    name: "Config: Unit Size"
+    id: cfg_unit_size
+    icon: "mdi:resize"
+    entity_category: config
+    optimistic: true
+    options:
+      - "Large"
+      - "Small"
+    lambda: |-
+      switch (id(comfoair_climate).get_cfg_size()) {
+        case 1: return std::string("Large");
+        case 2: return std::string("Small");
+        default: return std::string("Large");
+      }
+    set_action:
+      - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to change config flags"); return; }
+          uint8_t v = (x == "Small") ? 2 : 1;
+          id(comfoair_climate).set_cfg_size(v);
+  - platform: template
+    name: "Config: Enthalpy Present"
+    id: cfg_enthalpy_present
+    icon: "mdi:water-percent"
+    entity_category: config
+    optimistic: true
+    options:
+      - "Absent"
+      - "Present"
+      - "Without sensor"
+    lambda: |-
+      switch (id(comfoair_climate).get_cfg_enthalpy_present()) {
+        case 0: return std::string("Absent");
+        case 1: return std::string("Present");
+        case 2: return std::string("Without sensor");
+        default: return std::string("Absent");
+      }
+    set_action:
+      - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to change config flags"); return; }
+          uint8_t v = 0;
+          if (x == "Present") v = 1;
+          else if (x == "Without sensor") v = 2;
+          id(comfoair_climate).set_cfg_enthalpy_present(v);
+  - platform: template
+    name: "Config: EWT Present"
+    id: cfg_ewt_present
+    icon: "mdi:heat-pump"
+    entity_category: config
+    optimistic: true
+    options:
+      - "Absent"
+      - "Regulated"
+      - "Unregulated"
+    lambda: |-
+      switch (id(comfoair_climate).get_cfg_ewt_present()) {
+        case 0: return std::string("Absent");
+        case 1: return std::string("Regulated");
+        case 2: return std::string("Unregulated");
+        default: return std::string("Absent");
+      }
+    set_action:
+      - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to change config flags"); return; }
+          uint8_t v = 0;
+          if (x == "Regulated") v = 1;
+          else if (x == "Unregulated") v = 2;
+          id(comfoair_climate).set_cfg_ewt_present(v);
+  - platform: template
+    name: "Config: Analog Priority"
+    id: cfg_analog_priority
+    icon: "mdi:priority-high"
+    entity_category: config
+    optimistic: true
+    options:
+      - "Analog inputs"
+      - "Weekly program"
+    lambda: |-
+      return (id(comfoair_climate).get_analog_priority() == 1)
+        ? std::string("Weekly program")
+        : std::string("Analog inputs");
+    set_action:
+      - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to change config flags"); return; }
+          uint8_t v = (x == "Weekly program") ? 1 : 0;
+          id(comfoair_climate).set_analog_priority(v);

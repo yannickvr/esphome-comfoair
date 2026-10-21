@@ -92,6 +92,12 @@ CONF_P95_ACTIVE = "p95_active"
 CONF_P96_ACTIVE = "p96_active"
 CONF_P97_ACTIVE = "p97_active"
 
+CONF_EWT_LOW_TEMPERATURE = "ewt_low_temperature"
+CONF_EWT_HIGH_TEMPERATURE = "ewt_high_temperature"
+CONF_EWT_SPEED_UP_LEVEL = "ewt_speed_up_level"
+CONF_COOKERHOOD_SPEED_UP_LEVEL = "cookerhood_speed_up_level"
+CONF_REHEATING_TARGET_TEMPERATURE = "reheating_target_temperature"
+
 CONF_BATHROOM_SWITCH_ON_DELAY_MINUTES = "bathroom_switch_on_delay_minutes"
 CONF_BATHROOM_SWITCH_OFF_DELAY_MINUTES = "bathroom_switch_off_delay_minutes"
 CONF_L1_SWITCH_OFF_DELAY_MINUTES = "l1_switch_off_delay_minutes"
@@ -141,6 +147,11 @@ helper_comfoair = {
         CONF_RF_HIGH_TIME_SHORT_MINUTES,
         CONF_RF_HIGH_TIME_LONG_MINUTES,
         CONF_EXTRACTOR_HOOD_SWITCH_OFF_DELAY_MINUTES,
+        CONF_EWT_LOW_TEMPERATURE,
+        CONF_EWT_HIGH_TEMPERATURE,
+        CONF_EWT_SPEED_UP_LEVEL,
+        CONF_COOKERHOOD_SPEED_UP_LEVEL,
+        CONF_REHEATING_TARGET_TEMPERATURE,
     ],
     "binary_sensor": [
         CONF_BYPASS_PRESENT,
@@ -418,6 +429,37 @@ comfoair_sensors_schemas = cv.Schema(
         cv.Optional(CONF_EXTRACTOR_HOOD_SWITCH_OFF_DELAY_MINUTES): sensor.sensor_schema(
             device_class=DEVICE_CLASS_EMPTY,
             accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ).extend(),
+
+        cv.Optional(CONF_EWT_LOW_TEMPERATURE): sensor.sensor_schema(
+            device_class=DEVICE_CLASS_TEMPERATURE,
+            unit_of_measurement=UNIT_CELSIUS,
+            accuracy_decimals=1,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ).extend(),
+        cv.Optional(CONF_EWT_HIGH_TEMPERATURE): sensor.sensor_schema(
+            device_class=DEVICE_CLASS_TEMPERATURE,
+            unit_of_measurement=UNIT_CELSIUS,
+            accuracy_decimals=1,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ).extend(),
+        cv.Optional(CONF_EWT_SPEED_UP_LEVEL): sensor.sensor_schema(
+            device_class=DEVICE_CLASS_EMPTY,
+            unit_of_measurement=UNIT_PERCENT,
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ).extend(),
+        cv.Optional(CONF_COOKERHOOD_SPEED_UP_LEVEL): sensor.sensor_schema(
+            device_class=DEVICE_CLASS_EMPTY,
+            unit_of_measurement=UNIT_PERCENT,
+            accuracy_decimals=0,
+            state_class=STATE_CLASS_MEASUREMENT,
+        ).extend(),
+        cv.Optional(CONF_REHEATING_TARGET_TEMPERATURE): sensor.sensor_schema(
+            device_class=DEVICE_CLASS_TEMPERATURE,
+            unit_of_measurement=UNIT_CELSIUS,
+            accuracy_decimals=1,
             state_class=STATE_CLASS_MEASUREMENT,
         ).extend(),
 
