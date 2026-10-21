@@ -28,7 +28,7 @@ esphome:
   name: ${node_name}
   comment: ${device_name}
   friendly_name: "${device_name}"
-  name_add_mac_suffix: true
+  name_add_mac_suffix: false
   project:
     name: "${developer}.${description}"
     version: 1.1.8
@@ -365,27 +365,19 @@ button:
           ESP_LOGW("custom", "Resetting ComfoAir unit settings to factory defaults");
           id(comfoair_climate).settings_reset();
 
-  # ---- Tier 3: Test-mode preheater override (DANGEROUS) ----
-  # Entering test mode suspends the unit's own regulation, including automatic
-  # frost protection. These actions force the preheater on for a fixed time and
-  # then auto-exit test mode. Use only knowingly.
+  # ---- Tier 3: start a timed preheater override (fixed duration) ----
+  # The matching ON/OFF state is the "Preheater Override (test mode)" switch
+  # below. This button just kicks off a 60s burst; the switch shows it active.
   - platform: template
     id: force_preheater_60s
-    name: "Force Preheater (60s, test mode)"
+    name: "Force Preheater (60s burst)"
     icon: "mdi:heating-coil"
     entity_category: config
     on_press:
       - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to use test-mode override"); return; }
           ESP_LOGW("custom", "FORCING preheater via test mode for 60s");
           id(comfoair_climate).force_preheater(60, 0x03);
-  - platform: template
-    id: force_preheater_stop
-    name: "Stop Preheater Override (exit test mode)"
-    icon: "mdi:heating-coil"
-    entity_category: config
-    on_press:
-      - lambda: |-
-          id(comfoair_climate).stop_test_mode_override();
 
 switch:
   - platform: factory_reset
@@ -534,6 +526,31 @@ switch:
       - lambda: |-
           if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to change config flags"); return; }
           id(comfoair_climate).set_cfg_postheating_pwm_present(false);
+
+  # ========================================================================
+  # Tier 3: Preheater override via TEST MODE (DANGEROUS)
+  # Turning this ON enters test mode and drives the preheater relay+triac for a
+  # long window (1 hour), re-asserting periodically. Test mode SUSPENDS the
+  # unit's own regulation, including automatic frost protection. Turning it OFF
+  # (or the auto-timeout) exits test mode and restores normal operation.
+  # The switch state reflects the actual test-mode state reported by the unit.
+  # ========================================================================
+  - platform: template
+    name: "Preheater Override (test mode)"
+    id: preheater_override
+    icon: "mdi:heating-coil"
+    entity_category: config
+    lambda: |-
+      return id(comfoair_climate).get_test_mode_active();
+    turn_on_action:
+      - lambda: |-
+          if (!id(comfoair_climate).get_developer_mode()) { ESP_LOGW("custom", "Enable Developer Mode to use test-mode override"); return; }
+          ESP_LOGW("custom", "Preheater override ON - entering test mode (self-regulation suspended)");
+          // Hold for up to 1 hour; toggle off to end sooner.
+          id(comfoair_climate).force_preheater(3600, 0x03);
+    turn_off_action:
+      - lambda: |-
+          id(comfoair_climate).stop_test_mode_override();
 
 number:
   - platform: template
@@ -857,7 +874,6 @@ select:
     id: cfg_unit_type
     icon: "mdi:air-conditioner"
     entity_category: config
-    optimistic: true
     options:
       - "Left"
       - "Right"
@@ -877,7 +893,6 @@ select:
     id: cfg_unit_size
     icon: "mdi:resize"
     entity_category: config
-    optimistic: true
     options:
       - "Large"
       - "Small"
@@ -897,7 +912,6 @@ select:
     id: cfg_enthalpy_present
     icon: "mdi:water-percent"
     entity_category: config
-    optimistic: true
     options:
       - "Absent"
       - "Present"
@@ -921,7 +935,6 @@ select:
     id: cfg_ewt_present
     icon: "mdi:heat-pump"
     entity_category: config
-    optimistic: true
     options:
       - "Absent"
       - "Regulated"
@@ -945,7 +958,6 @@ select:
     id: cfg_analog_priority
     icon: "mdi:priority-high"
     entity_category: config
-    optimistic: true
     options:
       - "Analog inputs"
       - "Weekly program"

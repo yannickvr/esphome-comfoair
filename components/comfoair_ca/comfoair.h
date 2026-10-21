@@ -151,6 +151,11 @@ namespace esphome
 
       void update() override
       {
+        // While a test-mode override is running, the state machine owns the bus.
+        // Suppress regular polling so poll frames don't collide with test frames.
+        if (test_state_ != TestState::IDLE)
+          return;
+
         switch (update_counter_)
         {
         case -4:
@@ -210,14 +215,9 @@ namespace esphome
 
       void loop() override
       {
-        // Test-mode safety watchdog: never leave the unit un-regulated. If a
-        // timed override is active and its deadline has passed, exit test mode.
-        if (test_mode_active_ && test_mode_exit_at_ms_ != 0 &&
-            (int32_t)(millis() - test_mode_exit_at_ms_) >= 0)
-        {
-          LOG_WARN(TAG, "Test-mode override timed out, auto-exiting");
-          exit_test_mode_();
-        }
+        // Drive the test-mode state machine (enter -> drive -> hold -> exit),
+        // sending at most one frame per tick with spacing so frames don't collide.
+        test_mode_pump_();
 
         while (available() != 0)
         {
@@ -1289,9 +1289,25 @@ namespace esphome
       uint8_t status_ewt_present_{0};
       bool can_send_status_{false};
 
-      // Test-mode state for the preheater override (Tier 3)
+      // Test-mode state machine for the preheater override (Tier 3)
+      enum class TestState : uint8_t
+      {
+        IDLE,
+        ENTER,   // send CMD_SET_TEST_MODE, then wait
+        DRIVE,   // send CMD_SET_OUTPUTS / CMD_SET_FLAPS, then hold
+        HOLD,    // keep driving until the deadline
+        EXIT     // send CMD_EXIT_TEST_MODE, then back to IDLE
+      };
+      TestState test_state_{TestState::IDLE};
       bool test_mode_active_{false};
-      uint32_t test_mode_exit_at_ms_{0};
+      uint32_t test_mode_exit_at_ms_{0};      // deadline to leave test mode
+      uint32_t test_next_action_at_ms_{0};    // earliest time for the next frame
+      uint32_t test_duration_ms_{0};          // how long to hold the override
+      bool test_use_flap_{false};             // false = SET_OUTPUTS, true = SET_FLAPS
+      uint8_t test_drive_byte_a_{0};
+      uint8_t test_drive_byte_b_{0};
+      static const uint32_t test_frame_gap_ms_{750};   // spacing between enter/drive/exit
+      static const uint32_t test_reassert_ms_{2000};   // re-send drive while holding
 
     public:
       text_sensor::TextSensor *bootloader_info{nullptr};
@@ -1759,46 +1775,112 @@ namespace esphome
       // automatic frost protection). We drive the preheater relay+triac directly
       // and auto-exit after a timeout so the unit is never left un-regulated.
       // Gated behind developer mode by the YAML.
+      //
+      // IMPORTANT: commands must NOT be sent back-to-back in a single call. The
+      // bus is half-duplex and the unit replies to each frame; two frames in the
+      // same tick collide and corrupt both (symptom: "Checksum doesn't match").
+      // So the override is a small state machine, pumped once per test_mode_pump_()
+      // from loop() with a minimum spacing between frames.
 
-      void enter_test_mode_()
-      {
-        write_command_(CMD_SET_TEST_MODE, nullptr, 0);
-        test_mode_active_ = true;
-        LOG_WARN(TAG, "ENTERED TEST MODE - unit self-regulation is suspended");
-      }
-
-      void exit_test_mode_()
-      {
-        write_command_(CMD_EXIT_TEST_MODE, nullptr, 0);
-        test_mode_active_ = false;
-        test_mode_exit_at_ms_ = 0;
-        LOG_WARN(TAG, "Exited test mode - unit resumes self-regulation");
-      }
-
-      // Force the preheater on for `duration_seconds`, then auto-exit test mode.
-      // relay_mask: 0x01 preheating relay, 0x02 triac preheating (combine as needed).
+      // Begin a timed preheater override. Does NOT send anything synchronously;
+      // the state machine sends enter -> drive -> exit with proper spacing.
       void force_preheater(uint32_t duration_seconds, uint8_t relay_mask = 0x03)
       {
-        enter_test_mode_();
-        uint8_t outputs[2] = {(uint8_t)(relay_mask & 0x3F), 0x00};
-        write_command_(CMD_SET_OUTPUTS, outputs, sizeof(outputs));
-        test_mode_exit_at_ms_ = millis() + duration_seconds * 1000UL;
-        LOG_WARN(TAG, "Forcing preheater (mask 0x%02X) for %u s", relay_mask, duration_seconds);
+        test_use_flap_ = false;
+        test_drive_byte_a_ = (uint8_t)(relay_mask & 0x3F);
+        test_drive_byte_b_ = 0x00;
+        test_duration_ms_ = duration_seconds * 1000UL;
+        test_state_ = TestState::ENTER;
+        test_next_action_at_ms_ = millis();
+        LOG_WARN(TAG, "Preheater override requested (mask 0x%02X) for %u s", relay_mask, duration_seconds);
       }
 
-      // Drive the preheating flap directly in test mode (1 open / 0 closed / 3 stop).
+      // Drive the preheating flap directly (1 open / 0 closed / 3 stop).
       void force_preheater_flap(uint8_t state, uint32_t duration_seconds)
       {
-        enter_test_mode_();
-        uint8_t flaps[2] = {0x03 /* bypass = stop (leave) */, state};
-        write_command_(CMD_SET_FLAPS, flaps, sizeof(flaps));
-        test_mode_exit_at_ms_ = millis() + duration_seconds * 1000UL;
-        LOG_WARN(TAG, "Driving preheater flap to %u for %u s", state, duration_seconds);
+        test_use_flap_ = true;
+        test_drive_byte_a_ = 0x03; // bypass flap = stop (leave as-is)
+        test_drive_byte_b_ = state;
+        test_duration_ms_ = duration_seconds * 1000UL;
+        test_state_ = TestState::ENTER;
+        test_next_action_at_ms_ = millis();
+        LOG_WARN(TAG, "Preheater flap override requested (state %u) for %u s", state, duration_seconds);
       }
 
-      void stop_test_mode_override() { exit_test_mode_(); }
+      // Request a clean exit from an active override.
+      void stop_test_mode_override()
+      {
+        if (test_state_ == TestState::IDLE)
+          return;
+        test_state_ = TestState::EXIT;
+        test_next_action_at_ms_ = millis();
+        LOG_WARN(TAG, "Preheater override stop requested");
+      }
 
       bool get_test_mode_active() const { return test_mode_active_; }
+
+      // Pump the test-mode state machine. Called from loop(); sends at most one
+      // frame per invocation and enforces a minimum gap between frames.
+      void test_mode_pump_()
+      {
+        if (test_state_ == TestState::IDLE)
+          return;
+
+        uint32_t now = millis();
+        if ((int32_t)(now - test_next_action_at_ms_) < 0)
+          return; // not time for the next step yet
+
+        switch (test_state_)
+        {
+        case TestState::ENTER:
+          write_command_(CMD_SET_TEST_MODE, nullptr, 0);
+          test_mode_active_ = true;
+          LOG_WARN(TAG, "ENTERED TEST MODE - unit self-regulation is suspended");
+          test_next_action_at_ms_ = now + test_frame_gap_ms_;
+          test_state_ = TestState::DRIVE;
+          break;
+
+        case TestState::DRIVE:
+        {
+          uint8_t cmd = test_use_flap_ ? CMD_SET_FLAPS : CMD_SET_OUTPUTS;
+          uint8_t payload[2] = {test_drive_byte_a_, test_drive_byte_b_};
+          write_command_(cmd, payload, sizeof(payload));
+          LOG_WARN(TAG, "Test-mode drive: cmd 0x%02X data %02X %02X", cmd, payload[0], payload[1]);
+          test_mode_exit_at_ms_ = now + test_duration_ms_;
+          test_next_action_at_ms_ = now + test_frame_gap_ms_;
+          test_state_ = TestState::HOLD;
+          break;
+        }
+
+        case TestState::HOLD:
+          // Hold until the override deadline, then exit. Re-assert the drive
+          // periodically so the unit doesn't time the outputs out on its own.
+          if ((int32_t)(now - test_mode_exit_at_ms_) >= 0)
+          {
+            test_state_ = TestState::EXIT;
+            test_next_action_at_ms_ = now;
+          }
+          else
+          {
+            uint8_t cmd = test_use_flap_ ? CMD_SET_FLAPS : CMD_SET_OUTPUTS;
+            uint8_t payload[2] = {test_drive_byte_a_, test_drive_byte_b_};
+            write_command_(cmd, payload, sizeof(payload));
+            test_next_action_at_ms_ = now + test_reassert_ms_;
+          }
+          break;
+
+        case TestState::EXIT:
+          write_command_(CMD_EXIT_TEST_MODE, nullptr, 0);
+          test_mode_active_ = false;
+          test_mode_exit_at_ms_ = 0;
+          test_state_ = TestState::IDLE;
+          LOG_WARN(TAG, "Exited test mode - unit resumes self-regulation");
+          break;
+
+        case TestState::IDLE:
+          break;
+        }
+      }
     };
 
   } // namespace comfoair_ca
